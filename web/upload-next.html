@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Configure Output</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="inspected-page">
+    <main class="shell">
+      <section class="hero compact-hero" aria-labelledby="upload-title">
+        <div>
+          <p class="eyebrow">Output Setup</p>
+          <h1 id="upload-title">Prepare Final Video</h1>
+          <p class="summary">
+            Turn on only the changes this video actually needs, review the
+            current profile on the side, then prepare the final output.
+          </p>
+        </div>
+      </section>
+
+      <section class="config-layout">
+        <section class="panel config-main">
+          <div class="panel-head">
+            <span class="step">01</span>
+            <h2>Input Data</h2>
+          </div>
+
+          <p id="uploadSelectedFile" class="selected-file">Loading video...</p>
+
+          <div id="featureTags" class="feature-tags"></div>
+
+          <section id="formatNeeds" class="needs-grid"></section>
+
+          <section class="option-card timestamp-card">
+            <div class="option-head">
+              <h3>Timestamp</h3>
+              <span class="option-state ready">Set ranges</span>
+            </div>
+            <p class="option-copy">
+              Add only the middle scenes you want removed. Use `HH:MM:SS`
+              format for both start and end.
+            </p>
+
+            <div class="timestamp-strip-head">
+              <span>Start</span>
+              <span>End</span>
+            </div>
+
+            <div id="timestampRows" class="timestamp-rows"></div>
+
+            <div class="timestamp-actions">
+              <button id="addTimestampButton" type="button">Add</button>
+            </div>
+
+            <div id="timestampValidation" class="validation" role="status"></div>
+          </section>
+
+          <div class="action-row">
+            <button id="runButton" class="run-button run-danger" type="button">Run</button>
+            <button id="downloadButton" class="run-button download-success" type="button" hidden>
+              Download
+            </button>
+          </div>
+        </section>
+
+        <aside class="panel profile-side">
+          <div class="panel-head">
+            <span class="step">02</span>
+            <h2>Profile</h2>
+          </div>
+          <div id="currentProperties" class="profile-list"></div>
+
+          <div class="panel-head top-gap">
+            <span class="step">03</span>
+            <h2>Changing Now</h2>
+          </div>
+          <div id="pendingChanges" class="profile-list"></div>
+          <div class="panel-head top-gap">
+            <span class="step">04</span>
+            <h2>Process Dashboard</h2>
+          </div>
+          <div class="dashboard-panel process-panel">
+            <div class="dashboard-metrics">
+              <div class="dashboard-card">
+                <span>Estimate time</span>
+                <strong id="estimateTime">Calculating...</strong>
+              </div>
+              <div class="dashboard-card">
+                <span>State</span>
+                <strong id="processState">Waiting</strong>
+              </div>
+            </div>
+            <div id="nextStatus" class="dashboard-status">
+              Loading current properties...
+            </div>
+            <button id="stopButton" class="run-button stop-button" type="button" hidden>Stop</button>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <template id="needCardTemplate">
+      <section class="option-card need-card">
+        <div class="option-head">
+          <h3 class="need-title"></h3>
+          <span class="option-state needs">Needed</span>
+        </div>
+        <p class="option-copy need-copy"></p>
+        <div class="need-body"></div>
+      </section>
+    </template>
+
+    <script src="/upload-next.js"></script>
+  </body>
+</html>

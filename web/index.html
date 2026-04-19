@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MKV Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero" aria-labelledby="page-title">
+        <div>
+          <p class="eyebrow">Local FFmpeg workspace</p>
+          <h1 id="page-title">Welcome to Abhay Edit Video</h1>
+          <p class="summary">
+            Inspect video properties, make TV-ready MKV files, merge uploaded
+            subtitles, and cut marked scenes without heavy re-encoding.
+          </p>
+        </div>
+        <div class="hero-meter" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+      </section>
+
+      <section class="entry" aria-labelledby="welcome-title">
+        <div class="panel welcome-panel">
+          <div class="panel-head">
+            <span class="step">01</span>
+            <h2 id="welcome-title">Upload / Inspect</h2>
+          </div>
+          <p class="welcome-copy">
+            Start by uploading a video. Inspect reads the file properties first,
+            then opens the editing and TV-ready tools.
+          </p>
+
+          <form id="videoUpload" class="upload-box video-upload">
+            <label class="file-picker">
+              <span>Choose video</span>
+              <input id="videoFile" name="video" type="file" accept=".mkv,.mp4,.avi,.mov,.m4v,.webm" />
+            </label>
+            <p id="videoName" class="file-name">No video selected</p>
+          </form>
+
+          <label class="field">
+            <span>Or use existing workspace video</span>
+            <select id="workspaceVideoSelect">
+              <option value="">No workspace video selected</option>
+            </select>
+          </label>
+
+          <button id="inspectButton" class="run-button inspect-main" type="button">
+            Upload and inspect
+          </button>
+
+          <div id="entryValidation" class="validation" role="status"></div>
+        </div>
+
+        <div class="welcome-stage">
+          <div class="device-frame">
+            <div class="drop-zone upload-hero">
+              <div class="play-mark"></div>
+              <p>Upload file</p>
+              <span>Only after inspect will the tool menu appear.</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

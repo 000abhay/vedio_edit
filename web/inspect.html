@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Inspect Video</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="inspected-page">
+    <main class="shell">
+      <section class="hero compact-hero" aria-labelledby="inspect-title">
+        <div>
+          <p class="eyebrow">Inspect Result</p>
+          <h1 id="inspect-title">Video Properties</h1>
+          <p class="summary">
+            This page shows the important light and heavy process checks for the
+            selected video.
+          </p>
+        </div>
+      </section>
+
+      <section class="result-grid route-grid">
+        <section class="result-card">
+          <div class="panel-head">
+            <span class="step">01</span>
+            <h2>Properties</h2>
+          </div>
+          <p id="selectedFile" class="selected-file">Loading video...</p>
+          <div id="reportCards" class="dashboard-grid"></div>
+          <div class="property-columns">
+            <div>
+              <h3>Light process</h3>
+              <div id="lightChecks" class="check-list"></div>
+            </div>
+            <div>
+              <h3>Heavy process</h3>
+              <div id="heavyChecks" class="check-list"></div>
+            </div>
+          </div>
+          <div class="dashboard-panel">
+            <div class="dashboard-head">
+              <h3>Inspection Summary</h3>
+            </div>
+            <div id="report" class="report-grid">Loading...</div>
+          </div>
+        </section>
+
+        <section class="result-card">
+          <div class="panel-head">
+            <span class="step">02</span>
+            <h2>Next</h2>
+          </div>
+          <div class="dashboard-panel">
+            <div class="dashboard-head">
+              <h3>Inspect Status</h3>
+            </div>
+            <div id="statusLog" class="dashboard-status">Inspecting selected file...</div>
+          </div>
+          <a id="nextButton" class="download-link" href="/upload-next.html">Upload</a>
+        </section>
+      </section>
+    </main>
+
+    <script src="/inspect.js"></script>
+  </body>
+</html>
