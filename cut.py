@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -273,12 +274,29 @@ def default_output_path(video: Path) -> Path:
     return Path.cwd() / DEFAULT_OUTPUT_NAME
 
 
+def short_video_prefix(video: Path) -> str:
+    prefix = video.stem[:10]
+    prefix = re.sub(r"[^A-Za-z0-9]+", "_", prefix).strip("_")
+    return prefix or "video"
+
+
+def numbered_output_path(video: Path, tag: str, directory: Path | None = None) -> Path:
+    base_dir = directory or Path.cwd()
+    prefix = short_video_prefix(video)
+    counter = 1
+    while True:
+        candidate = base_dir / f"{prefix}_{tag}{counter}.mkv"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
 def default_remux_output_path(video: Path) -> Path:
-    return Path.cwd() / f"{video.stem}_tv.mkv"
+    return numbered_output_path(video, "tv")
 
 
 def default_subtitle_output_path(video: Path) -> Path:
-    return Path.cwd() / f"{video.stem}_subbed.mkv"
+    return numbered_output_path(video, "sub")
 
 
 def parse_args() -> argparse.Namespace:

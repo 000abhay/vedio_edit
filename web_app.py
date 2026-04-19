@@ -228,13 +228,7 @@ def inspect_summary(ffprobe: str, video: Path) -> dict:
 
 
 def next_output_path(video: Path) -> Path:
-    base_name = f"{video.stem}_ready"
-    candidate = ROOT / f"{base_name}.mkv"
-    index = 2
-    while candidate.exists():
-        candidate = ROOT / f"{base_name}_{index}.mkv"
-        index += 1
-    return candidate
+    return cut.numbered_output_path(video, "project", ROOT)
 
 
 def parse_timestamp_ranges(items: list[dict]) -> list[tuple[str, str]]:
@@ -638,7 +632,7 @@ class VideoToolHandler(BaseHTTPRequestHandler):
     def handle_to_mkv(self) -> None:
         payload = self.read_json()
         video = safe_relative_path(payload.get("video", ""), VIDEO_EXTENSIONS, "Video")
-        output = safe_output_name(payload.get("output"), f"{video.stem}_tv.mkv")
+        output = safe_output_name(payload.get("output"), cut.default_remux_output_path(video).name)
         ffmpeg = cut.resolve_tool("ffmpeg")
         cut.remux_to_mkv(ffmpeg, video, str(output))
         self.send_json(
@@ -655,7 +649,7 @@ class VideoToolHandler(BaseHTTPRequestHandler):
         subtitle = safe_relative_path(
             payload.get("subtitle", ""), SUBTITLE_EXTENSIONS, "Subtitle"
         )
-        output = safe_output_name(payload.get("output"), f"{video.stem}_subbed.mkv")
+        output = safe_output_name(payload.get("output"), cut.default_subtitle_output_path(video).name)
         ffmpeg = cut.resolve_tool("ffmpeg")
         cut.add_subtitle(ffmpeg, str(video), str(subtitle), str(output))
         self.send_json(
