@@ -353,7 +353,7 @@ function renderPendingChanges() {
     rows.push(
       createProfileRow(
         "Subtitle",
-        subtitle && subtitle !== "No subtitle selected" ? subtitle : "Need English subtitle"
+        subtitle && subtitle !== "No subtitle selected" ? subtitle : "Optional: no subtitle selected"
       )
     );
   }
@@ -540,12 +540,8 @@ runButton.addEventListener("click", async () => {
   const ranges = collectTimestamps().filter((item) => item.start && item.end);
   const subtitle = selectedSubtitleName();
   const subtitleNeeded = (englishSubtitle && !englishSubtitle.ok) || (textSubtitle && !textSubtitle.ok);
-
-  if (subtitleNeeded && (!subtitle || subtitle === "No subtitle selected")) {
-    processState.textContent = "Validation error";
-    setDashboardLines(["Run stopped: subtitle is still needed before final export."]);
-    return;
-  }
+  const subtitleToUse =
+    subtitleNeeded && subtitle && subtitle !== "No subtitle selected" ? subtitle : "";
 
   runButton.disabled = true;
   resetRunState();
@@ -556,7 +552,7 @@ runButton.addEventListener("click", async () => {
   try {
     const data = await requestJson("/api/process/start", {
       video: getVideoFromUrl(),
-      subtitle: subtitleNeeded ? subtitle : "",
+      subtitle: subtitleToUse,
       timestamps: ranges,
     });
     activeJobId = data.job_id;
