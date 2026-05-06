@@ -41,9 +41,19 @@ function renderChecks(target, checks) {
 function parseReport(reportText) {
   const lines = reportText.split("\n");
   const pick = (prefix) => lines.find((line) => line.startsWith(prefix))?.slice(prefix.length) || "unknown";
-  const videoLine = lines.find((line) => line.trim().startsWith("#0:"))?.trim() || "unknown";
-  const audioLine = lines.find((line) => line.trim().startsWith("#1:"))?.trim() || "unknown";
-  const subtitleLine = lines.find((line) => line.trim().startsWith("#2:"))?.trim() || "none";
+  const sectionLine = (heading, fallback) => {
+    const start = lines.findIndex((line) => line.trim() === heading);
+    if (start === -1) return fallback;
+    for (let index = start + 1; index < lines.length; index += 1) {
+      const line = lines[index].trim();
+      if (!line) break;
+      if (line.startsWith("#")) return line;
+    }
+    return fallback;
+  };
+  const videoLine = sectionLine("Video streams:", "unknown");
+  const audioLine = sectionLine("Audio streams:", "unknown");
+  const subtitleLine = sectionLine("Subtitle streams:", "none");
   return {
     container: pick("Container: "),
     duration: pick("Duration: "),

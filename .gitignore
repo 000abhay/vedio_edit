@@ -7,4 +7,5 @@ __pycache__/
 *.avi
 *.m4v
 *.webm
+uploads/
 .codex

@@ -12,6 +12,8 @@ const downloadButton = document.querySelector("#downloadButton");
 const stopButton = document.querySelector("#stopButton");
 const estimateTime = document.querySelector("#estimateTime");
 const processState = document.querySelector("#processState");
+const dashboardLoader = document.querySelector("#dashboardLoader");
+const dashboardLoaderText = document.querySelector("#dashboardLoaderText");
 const needCardTemplate = document.querySelector("#needCardTemplate");
 
 let inspectData = null;
@@ -20,6 +22,7 @@ let subtitleSelection = "";
 let runReady = false;
 let downloadUrl = "";
 let activeJobId = "";
+let stopRequested = false;
 
 function getVideoFromUrl() {
   const params = new URLSearchParams(window.location.search);
@@ -59,10 +62,19 @@ function escapeHtml(value) {
 function parseReport(report) {
   const lines = report.split("\n");
   const pick = (prefix) => lines.find((line) => line.startsWith(prefix))?.slice(prefix.length) || "unknown";
-  const videoLine = lines.find((line) => line.trim().startsWith("#0:"))?.trim() || "unknown";
-  const audioLine = lines.find((line) => line.trim().startsWith("#1:"))?.trim() || "unknown";
-  const subtitlePresent = report.includes("Subtitle streams:\n  none") ? "none" : "present";
-  const subtitleLine = lines.find((line) => line.trim().startsWith("#2:"))?.trim() || subtitlePresent;
+  const sectionLine = (heading, fallback) => {
+    const start = lines.findIndex((line) => line.trim() === heading);
+    if (start === -1) return fallback;
+    for (let index = start + 1; index < lines.length; index += 1) {
+      const line = lines[index].trim();
+      if (!line) break;
+      if (line.startsWith("#")) return line;
+    }
+    return fallback;
+  };
+  const videoLine = sectionLine("Video streams:", "unknown");
+  const audioLine = sectionLine("Audio streams:", "unknown");
+  const subtitleLine = sectionLine("Subtitle streams:", "none");
   return {
     container: pick("Container: "),
     duration: pick("Duration: "),
@@ -305,6 +317,13 @@ function setDashboardLines(lines) {
   nextStatus.innerHTML = lines.map((line) => `<div class="status-line">${escapeHtml(line)}</div>`).join("");
 }
 
+function setDashboardLoader(mode = "idle", label = "Processing video...") {
+  const visible = mode === "running" || mode === "success";
+  dashboardLoader.dataset.mode = mode;
+  dashboardLoader.hidden = !visible || (mode === "running" && stopRequested);
+  dashboardLoaderText.textContent = label;
+}
+
 function estimateSeconds() {
   const sizeText = currentProfile?.size || "";
   const sizeMatch = sizeText.match(/([\d.]+)\s+MiB/);
@@ -371,9 +390,11 @@ function resetRunState() {
   runReady = false;
   downloadUrl = "";
   activeJobId = "";
+  stopRequested = false;
   downloadButton.hidden = true;
   stopButton.hidden = true;
   processState.textContent = "Waiting";
+  setDashboardLoader("idle");
 }
 
 async function loadSubtitleOptions() {
@@ -444,6 +465,9 @@ async function pollJob(jobId) {
     const response = await fetch(`/api/process/status?id=${encodeURIComponent(jobId)}`);
     const data = await response.json();
     processState.textContent = data.state_label || data.state;
+    if (!stopRequested && (data.state === "queued" || data.state === "running")) {
+      setDashboardLoader("running", data.progress_text || data.stage || "Rabbit is running...");
+    }
 
     const lines = [];
     if (data.stage) lines.push(`Stage: ${data.stage}`);
@@ -460,6 +484,8 @@ async function pollJob(jobId) {
       stopButton.hidden = true;
       runButton.disabled = false;
       activeJobId = "";
+      stopRequested = false;
+      setDashboardLoader("success", "Rabbit says your video is ready.");
       return;
     }
 
@@ -469,6 +495,8 @@ async function pollJob(jobId) {
       stopButton.hidden = true;
       runButton.disabled = false;
       activeJobId = "";
+      stopRequested = false;
+      setDashboardLoader("idle");
       return;
     }
 
@@ -532,6 +560,7 @@ runButton.addEventListener("click", async () => {
     resetRunState();
     processState.textContent = "Validation error";
     setDashboardLines([`Run stopped: ${error}`]);
+    setDashboardLoader("idle");
     return;
   }
 
@@ -545,9 +574,11 @@ runButton.addEventListener("click", async () => {
 
   runButton.disabled = true;
   resetRunState();
+  stopRequested = false;
   processState.textContent = "Starting";
   stopButton.hidden = false;
   setDashboardLines(["Starting processing job..."]);
+  setDashboardLoader("running", "Rabbit is getting ready...");
 
   try {
     const data = await requestJson("/api/process/start", {
@@ -557,23 +588,29 @@ runButton.addEventListener("click", async () => {
     });
     activeJobId = data.job_id;
     processState.textContent = "Running";
+    setDashboardLoader("running", "Rabbit is running...");
     await pollJob(data.job_id);
   } catch (runError) {
     processState.textContent = "Error";
     setDashboardLines([`Run stopped: ${runError.message}`]);
     runButton.disabled = false;
+    setDashboardLoader("idle");
   }
 });
 
 stopButton.addEventListener("click", async () => {
   if (!activeJobId) return;
   stopButton.disabled = true;
+  stopRequested = true;
+  setDashboardLoader("idle");
   try {
     await requestJson("/api/process/stop", { job_id: activeJobId });
     processState.textContent = "Stopping";
     setDashboardLines(["Stop requested. Waiting for the current step to end..."]);
   } catch (error) {
     setDashboardLines([`Could not stop process: ${error.message}`]);
+    stopRequested = false;
+    setDashboardLoader("running", "Rabbit is still running...");
   } finally {
     stopButton.disabled = false;
   }

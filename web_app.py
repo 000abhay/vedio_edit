@@ -4,6 +4,7 @@ import io
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -62,6 +63,38 @@ def safe_output_name(value: str | None, default_name: str) -> Path:
         raise ValueError("Output name must end with .mkv.")
 
     return ROOT / output.name
+
+
+def auto_output_path(video: Path) -> Path:
+    return ROOT / f"{cut.short_video_prefix(video)}_updated.mkv"
+
+
+def auto_output_regex(video: Path) -> re.Pattern[str]:
+    prefix = re.escape(cut.short_video_prefix(video))
+    return re.compile(rf"^{prefix}_(?:updated|project\d+|tv\d+|sub\d+)\.mkv$", re.IGNORECASE)
+
+
+def cleanup_auto_outputs(video: Path, keep: Path) -> None:
+    output_pattern = auto_output_regex(video)
+    for path in ROOT.iterdir():
+        if not path.is_file() or path == keep:
+            continue
+        if output_pattern.fullmatch(path.name):
+            path.unlink()
+
+
+def temp_output_path(output: Path) -> Path:
+    return output.with_suffix(f".tmp{output.suffix}")
+
+
+def replace_output_file(source: Path, destination: Path) -> None:
+    temporary_output = temp_output_path(destination)
+    if temporary_output.exists():
+        temporary_output.unlink()
+    if source.resolve() == destination.resolve():
+        return
+    shutil.copy2(source, temporary_output)
+    temporary_output.replace(destination)
 
 
 def capture_output(func, *args, **kwargs) -> str:
@@ -220,15 +253,122 @@ def inspect_summary(ffprobe: str, video: Path) -> dict:
             },
             {
                 "label": "Exact frame cutting",
-                "ok": False,
-                "detail": "Heavy operation. Current fast cuts are keyframe-based.",
+                "ok": True,
+                "detail": "Enabled in web workflow. Timestamp cuts are re-encoded for better accuracy.",
             },
         ],
     }
 
 
+def subtitle_stream_infos(ffprobe: str, video: Path) -> list[dict]:
+    data = cut.probe_media(ffprobe, video)
+    streams = data.get("streams") or []
+    subtitle_infos: list[dict] = []
+    subtitle_index = 0
+    for stream in streams:
+        if stream.get("codec_type") != "subtitle":
+            continue
+        tags = stream.get("tags") or {}
+        disposition = stream.get("disposition") or {}
+        codec_name = str(stream.get("codec_name") or "").lower()
+        subtitle_infos.append(
+            {
+                "ffmpeg_index": subtitle_index,
+                "codec_name": codec_name,
+                "language": str(tags.get("language") or "").strip(),
+                "title": str(tags.get("title") or "").strip(),
+                "default": bool(disposition.get("default")),
+                "forced": bool(disposition.get("forced")),
+                "text_based": codec_name in cut.TEXT_SUBTITLE_CODECS,
+            }
+        )
+        subtitle_index += 1
+    return subtitle_infos
+
+
+def parse_srt_timestamp(value: str) -> float:
+    return cut.parse_timestamp(value.strip().replace(",", "."))
+
+
+def format_srt_timestamp(value: float) -> str:
+    total_milliseconds = max(0, round(value * 1000))
+    hours = total_milliseconds // 3_600_000
+    minutes = (total_milliseconds % 3_600_000) // 60_000
+    seconds = (total_milliseconds % 60_000) // 1000
+    milliseconds = total_milliseconds % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+def parse_srt_blocks(text: str) -> list[dict]:
+    blocks: list[dict] = []
+    for raw_block in text.replace("\r\n", "\n").replace("\r", "\n").split("\n\n"):
+        lines = raw_block.split("\n")
+        if not any(line.strip() for line in lines):
+            continue
+
+        timing_index = None
+        for index, line in enumerate(lines):
+            if "-->" in line:
+                timing_index = index
+                break
+        if timing_index is None:
+            continue
+
+        timing_line = lines[timing_index]
+        start_text, _, end_text = timing_line.partition("-->")
+        start_value = start_text.strip().split()[0]
+        end_value = end_text.strip().split()[0]
+        blocks.append(
+            {
+                "start": parse_srt_timestamp(start_value),
+                "end": parse_srt_timestamp(end_value),
+                "text_lines": lines[timing_index + 1 :],
+            }
+        )
+    return blocks
+
+
+def render_srt_blocks(blocks: list[dict]) -> str:
+    rows: list[str] = []
+    for index, block in enumerate(blocks, start=1):
+        rows.append(str(index))
+        rows.append(f"{format_srt_timestamp(block['start'])} --> {format_srt_timestamp(block['end'])}")
+        rows.extend(block["text_lines"] or [""])
+        rows.append("")
+    return "\n".join(rows).strip() + ("\n" if rows else "")
+
+
+def retime_srt_text(text: str, keep_segments: list[tuple[float, float]]) -> str:
+    blocks = parse_srt_blocks(text)
+    if not blocks:
+        return ""
+
+    segment_offsets: list[tuple[float, float, float]] = []
+    output_offset = 0.0
+    for start, end in keep_segments:
+        segment_offsets.append((start, end, output_offset))
+        output_offset += end - start
+
+    shifted_blocks: list[dict] = []
+    for block in blocks:
+        for keep_start, keep_end, offset in segment_offsets:
+            overlap_start = max(block["start"], keep_start)
+            overlap_end = min(block["end"], keep_end)
+            if overlap_end <= overlap_start:
+                continue
+            shifted_blocks.append(
+                {
+                    "start": offset + (overlap_start - keep_start),
+                    "end": offset + (overlap_end - keep_start),
+                    "text_lines": list(block["text_lines"]),
+                }
+            )
+    shifted_blocks.sort(key=lambda item: (item["start"], item["end"]))
+    return render_srt_blocks(shifted_blocks)
+
+
 def next_output_path(video: Path) -> Path:
-    return cut.numbered_output_path(video, "project", ROOT)
+    return auto_output_path(video)
 
 
 def parse_timestamp_ranges(items: list[dict]) -> list[tuple[str, str]]:
@@ -265,7 +405,9 @@ def estimate_process_seconds(video: Path, summary: dict, timestamp_ranges: list[
     subtitle_ok = next(item["ok"] for item in summary["light"] if item["label"] == "English subtitles")
     if not subtitle_ok:
         estimate += 6
-    estimate += len(timestamp_ranges) * 5
+    if timestamp_ranges:
+        estimate += max(20, int(size_mib / 12))
+        estimate += len(timestamp_ranges) * 10
     return max(10, estimate)
 
 
@@ -419,7 +561,147 @@ def create_copy_cut_video_job(
     run_command_for_job(job_id, concat_command)
 
 
-def add_subtitle_job(job_id: str, ffmpeg: str, video: Path, subtitle: Path, output_path: Path) -> None:
+def create_precise_cut_video_job(
+    job_id: str,
+    ffmpeg: str,
+    video: Path,
+    output_path: Path,
+    keep_segments: list[tuple[float, float]],
+    include_audio: bool,
+) -> None:
+    filter_complex = cut.build_filter_complex(keep_segments, include_audio)
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[outv]",
+    ]
+    if include_audio:
+        command.extend(["-map", "[outa]"])
+    command.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"])
+    if include_audio:
+        command.extend(["-c:a", "aac", "-b:a", "192k"])
+    command.extend(["-sn", str(output_path)])
+    run_command_for_job(job_id, command)
+
+
+def extract_subtitle_stream_job(
+    job_id: str,
+    ffmpeg: str,
+    video: Path,
+    stream_index: int,
+    output_path: Path,
+) -> None:
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video),
+        "-map",
+        f"0:s:{stream_index}",
+        "-c:s",
+        "srt",
+        str(output_path),
+    ]
+    run_command_for_job(job_id, command)
+
+
+def rebuild_subtitles_after_cut_job(
+    job_id: str,
+    ffmpeg: str,
+    video: Path,
+    subtitle_tracks: list[dict],
+    output_path: Path,
+) -> None:
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video),
+    ]
+    for track in subtitle_tracks:
+        command.extend(["-i", str(track["path"])])
+    command.extend(["-map", "0"])
+    for input_index in range(1, len(subtitle_tracks) + 1):
+        command.extend(["-map", f"{input_index}:0"])
+    command.extend(["-c", "copy", "-c:s", "srt"])
+
+    for subtitle_index, track in enumerate(subtitle_tracks):
+        language = str(track.get("language") or "").strip()
+        title = str(track.get("title") or "").strip()
+        disposition_flags: list[str] = []
+        if track.get("default"):
+            disposition_flags.append("default")
+        if track.get("forced"):
+            disposition_flags.append("forced")
+        if language:
+            command.extend([f"-metadata:s:s:{subtitle_index}", f"language={language}"])
+        if title:
+            command.extend([f"-metadata:s:s:{subtitle_index}", f"title={title}"])
+        if disposition_flags:
+            command.extend([f"-disposition:s:{subtitle_index}", "+".join(disposition_flags)])
+
+    command.append(str(output_path))
+    run_command_for_job(job_id, command)
+
+
+def prepare_shifted_subtitle_tracks(
+    job_id: str,
+    ffmpeg: str,
+    ffprobe: str,
+    video: Path,
+    keep_segments: list[tuple[float, float]],
+    temp_dir: Path,
+) -> tuple[list[dict], list[str]]:
+    tracks: list[dict] = []
+    dropped_codecs: list[str] = []
+    for info in subtitle_stream_infos(ffprobe, video):
+        if not info["text_based"]:
+            dropped_codecs.append(info["codec_name"] or "unknown")
+            continue
+
+        extracted_path = temp_dir / f"subtitle_{info['ffmpeg_index']:02d}.srt"
+        shifted_path = temp_dir / f"subtitle_{info['ffmpeg_index']:02d}_shifted.srt"
+        extract_subtitle_stream_job(job_id, ffmpeg, video, info["ffmpeg_index"], extracted_path)
+        text = extracted_path.read_text(encoding="utf-8-sig", errors="replace")
+        shifted_text = retime_srt_text(text, keep_segments)
+        if not shifted_text.strip():
+            continue
+        shifted_path.write_text(shifted_text, encoding="utf-8")
+        tracks.append(
+            {
+                "path": shifted_path,
+                "language": info["language"],
+                "title": info["title"],
+                "default": info["default"],
+                "forced": info["forced"],
+            }
+        )
+    return tracks, dropped_codecs
+
+
+def add_subtitle_job(
+    job_id: str,
+    ffmpeg: str,
+    ffprobe: str,
+    video: Path,
+    subtitle: Path,
+    output_path: Path,
+) -> None:
+    existing_subtitle_count = len(subtitle_stream_infos(ffprobe, video))
     command = [
         ffmpeg,
         "-y",
@@ -438,7 +720,7 @@ def add_subtitle_job(job_id: str, ffmpeg: str, video: Path, subtitle: Path, outp
         "copy",
         "-c:s",
         "srt",
-        "-metadata:s:s:0",
+        f"-metadata:s:s:{existing_subtitle_count}",
         "language=eng",
         str(output_path),
     ]
@@ -501,26 +783,57 @@ def process_video_workflow(
                     )
             include_audio = cut.has_audio_stream(ffprobe, current_video)
             keep_segments = cut.build_keep_segments_from_cuts(duration, timestamp_ranges)
-            cut_output = temp_dir / f"{current_video.stem}_cut.mkv"
-            update_job(job_id, stage="Cutting timestamps", progress=25, progress_text="Splitting good scenes")
-            create_copy_cut_video_job(
-                job_id, ffmpeg, current_video, cut_output, keep_segments, include_audio, temp_dir
+            preserved_subtitle_tracks, dropped_subtitle_codecs = prepare_shifted_subtitle_tracks(
+                job_id, ffmpeg, ffprobe, current_video, keep_segments, temp_dir
             )
+            cut_output = temp_dir / f"{current_video.stem}_cut.mkv"
+            update_job(
+                job_id,
+                stage="Cutting timestamps",
+                progress=25,
+                progress_text="Re-encoding exact timestamp cuts",
+            )
+            create_precise_cut_video_job(job_id, ffmpeg, current_video, cut_output, keep_segments, include_audio)
             current_video = cut_output
-            operations.append(f"Timestamp cuts applied successfully for {len(timestamp_ranges)} range(s).")
+            operations.append(
+                f"Timestamp cuts applied accurately with re-encode for {len(timestamp_ranges)} range(s)."
+            )
             append_job_operation(job_id, operations[-1])
+            if preserved_subtitle_tracks:
+                update_job(
+                    job_id,
+                    stage="Rebuilding subtitles",
+                    progress=84,
+                    progress_text="Retiming existing subtitle tracks",
+                )
+                subtitle_output = temp_dir / f"{current_video.stem}_subbed_existing.mkv"
+                rebuild_subtitles_after_cut_job(
+                    job_id, ffmpeg, current_video, preserved_subtitle_tracks, subtitle_output
+                )
+                current_video = subtitle_output
+                operations.append(
+                    f"Preserved {len(preserved_subtitle_tracks)} existing subtitle track(s) after timestamp cuts."
+                )
+                append_job_operation(job_id, operations[-1])
+            if dropped_subtitle_codecs:
+                skipped = ", ".join(sorted(set(dropped_subtitle_codecs)))
+                operations.append(
+                    f"Skipped unsupported embedded subtitle track(s) during timestamp cuts: {skipped}."
+                )
+                append_job_operation(job_id, operations[-1])
 
         if subtitle is not None:
             update_job(job_id, stage="Merging subtitle", progress=88, progress_text="Adding subtitle track")
             sub_output = temp_dir / f"{current_video.stem}_subbed.mkv"
-            add_subtitle_job(job_id, ffmpeg, current_video, subtitle, sub_output)
+            add_subtitle_job(job_id, ffmpeg, ffprobe, current_video, subtitle, sub_output)
             current_video = sub_output
             operations.append(f"English subtitle merged successfully from {subtitle.name}.")
             append_job_operation(job_id, operations[-1])
 
         update_job(job_id, stage="Finalizing output", progress=95, progress_text="Saving final file")
         final_output = next_output_path(video)
-        shutil.copy2(current_video, final_output)
+        replace_output_file(current_video, final_output)
+        cleanup_auto_outputs(video, final_output)
         operations.append(f"Final video prepared successfully: {final_output.name}.")
         append_job_operation(job_id, operations[-1])
 
@@ -605,7 +918,7 @@ class VideoToolHandler(BaseHTTPRequestHandler):
         payload = self.read_json()
         video_value = payload.get("video") or cut.LOCAL_DEFAULT_VIDEO.name
         video = safe_relative_path(video_value, VIDEO_EXTENSIONS, "Video")
-        output = safe_output_name(payload.get("output"), "wolf_clean.mkv")
+        output = safe_output_name(payload.get("output"), auto_output_path(video).name)
         padding = float(payload.get("padding", cut.DEFAULT_CUT_PADDING_SECONDS))
         if padding < 0 or padding > 30:
             raise ValueError("Padding must be between 0 and 30 seconds.")
@@ -615,12 +928,13 @@ class VideoToolHandler(BaseHTTPRequestHandler):
         duration = cut.probe_duration(ffprobe, video)
         include_audio = cut.has_audio_stream(ffprobe, video)
         keep_segments = cut.build_keep_segments(duration, padding)
-        temp_output = output.with_suffix(f".tmp{output.suffix}")
+        temp_output = temp_output_path(output)
         if temp_output.exists():
             temp_output.unlink()
 
         cut.create_copy_cut_video(ffmpeg, video, temp_output, keep_segments, include_audio)
         temp_output.replace(output)
+        cleanup_auto_outputs(video, output)
         self.send_json(
             {
                 "ok": True,
@@ -632,9 +946,14 @@ class VideoToolHandler(BaseHTTPRequestHandler):
     def handle_to_mkv(self) -> None:
         payload = self.read_json()
         video = safe_relative_path(payload.get("video", ""), VIDEO_EXTENSIONS, "Video")
-        output = safe_output_name(payload.get("output"), cut.default_remux_output_path(video).name)
+        output = safe_output_name(payload.get("output"), auto_output_path(video).name)
         ffmpeg = cut.resolve_tool("ffmpeg")
-        cut.remux_to_mkv(ffmpeg, video, str(output))
+        temp_output = temp_output_path(output)
+        if temp_output.exists():
+            temp_output.unlink()
+        cut.remux_to_mkv(ffmpeg, video, str(temp_output))
+        temp_output.replace(output)
+        cleanup_auto_outputs(video, output)
         self.send_json(
             {
                 "ok": True,
@@ -649,9 +968,14 @@ class VideoToolHandler(BaseHTTPRequestHandler):
         subtitle = safe_relative_path(
             payload.get("subtitle", ""), SUBTITLE_EXTENSIONS, "Subtitle"
         )
-        output = safe_output_name(payload.get("output"), cut.default_subtitle_output_path(video).name)
+        output = safe_output_name(payload.get("output"), auto_output_path(video).name)
         ffmpeg = cut.resolve_tool("ffmpeg")
-        cut.add_subtitle(ffmpeg, str(video), str(subtitle), str(output))
+        temp_output = temp_output_path(output)
+        if temp_output.exists():
+            temp_output.unlink()
+        cut.add_subtitle(ffmpeg, str(video), str(subtitle), str(temp_output))
+        temp_output.replace(output)
+        cleanup_auto_outputs(video, output)
         self.send_json(
             {
                 "ok": True,
