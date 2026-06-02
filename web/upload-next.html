@@ -50,14 +50,14 @@
             <div id="timestampRows" class="timestamp-rows"></div>
 
             <div class="timestamp-actions">
-              <button id="addTimestampButton" type="button">Add</button>
+              <button id="addTimestampButton" type="button" aria-keyshortcuts="Shift+A">Add</button>
             </div>
 
             <div id="timestampValidation" class="validation" role="status"></div>
           </section>
 
           <div class="action-row">
-            <button id="runButton" class="run-button run-danger" type="button">Run</button>
+            <button id="runButton" class="run-button run-danger" type="button" aria-keyshortcuts="Shift+U">Run</button>
             <button id="downloadButton" class="run-button download-success" type="button" hidden>
               Download
             </button>
@@ -83,7 +83,7 @@
           <div class="dashboard-panel process-panel">
             <div class="dashboard-metrics">
               <div class="dashboard-card">
-                <span>Estimate time</span>
+                <span id="estimateLabel">Estimate time</span>
                 <strong id="estimateTime">Calculating...</strong>
               </div>
               <div class="dashboard-card">
@@ -112,10 +112,22 @@
               </div>
               <p id="dashboardLoaderText" class="loader-copy">Processing video...</p>
             </div>
+            <div
+              id="processProgress"
+              class="liquid-progress"
+              role="progressbar"
+              aria-label="Processing progress"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow="0"
+            >
+              <div id="processProgressFill" class="liquid-progress-fill"></div>
+              <span id="processProgressText">0%</span>
+            </div>
             <div id="nextStatus" class="dashboard-status">
               Loading current properties...
             </div>
-            <button id="stopButton" class="run-button stop-button" type="button" hidden>Stop</button>
+            <button id="stopButton" class="run-button stop-button" type="button" hidden aria-keyshortcuts="Shift+S">Stop</button>
           </div>
         </aside>
       </section>

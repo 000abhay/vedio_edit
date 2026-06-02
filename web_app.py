@@ -4,6 +4,7 @@ import io
 import json
 import mimetypes
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -411,6 +412,93 @@ def estimate_process_seconds(video: Path, summary: dict, timestamp_ranges: list[
     return max(10, estimate)
 
 
+FFMPEG_PROGRESS_KEYS = {
+    "bitrate",
+    "drop_frames",
+    "dup_frames",
+    "fps",
+    "frame",
+    "out_time",
+    "out_time_ms",
+    "out_time_us",
+    "progress",
+    "speed",
+    "stream_0_0_q",
+    "total_size",
+}
+
+
+def ffmpeg_progress_command(command: list[str]) -> list[str]:
+    if "-progress" in command:
+        return command
+    insert_at = 1
+    if "-hide_banner" in command:
+        insert_at = command.index("-hide_banner") + 1
+    return command[:insert_at] + ["-nostats", "-progress", "pipe:2"] + command[insert_at:]
+
+
+def is_ffmpeg_progress_line(line: str) -> bool:
+    key = line.split("=", 1)[0].strip()
+    return key in FFMPEG_PROGRESS_KEYS or (key.startswith("stream_") and key.endswith("_q"))
+
+
+def parse_ffmpeg_time(value: str) -> float | None:
+    value = value.strip()
+    if not value or value.upper() == "N/A":
+        return None
+    if re.fullmatch(r"-?\d+", value):
+        return max(0.0, int(value) / 1_000_000)
+    match = re.fullmatch(r"(\d+):(\d{2}):(\d{2})(?:\.(\d+))?", value)
+    if not match:
+        return None
+    hours, minutes, seconds, fraction = match.groups()
+    total = int(hours) * 3600 + int(minutes) * 60 + int(seconds)
+    if fraction:
+        total += float(f"0.{fraction}")
+    return max(0.0, total)
+
+
+def progress_from_ffmpeg_line(line: str) -> float | None:
+    if "=" not in line:
+        return None
+    key, value = line.strip().split("=", 1)
+    if key == "out_time_us" or key == "out_time_ms":
+        return parse_ffmpeg_time(value)
+    if key == "out_time":
+        return parse_ffmpeg_time(value)
+    return None
+
+
+def update_job_progress(job_id: str, progress: float) -> None:
+    progress = max(0, min(100, int(round(progress))))
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job["progress"] = max(int(job.get("progress", 0)), progress)
+
+
+def job_timing_snapshot(job: dict) -> tuple[int, int | None]:
+    now = time.time()
+    started_at = job.get("started_at")
+    finished_at = job.get("finished_at")
+    if not started_at:
+        return 0, job.get("estimate_seconds")
+
+    end_at = finished_at or now
+    elapsed = max(0, int(round(end_at - started_at)))
+    state = job.get("state")
+    if state in {"success", "error", "stopped"}:
+        return elapsed, 0
+
+    progress = max(0, min(100, float(job.get("progress") or 0)))
+    if progress >= 1:
+        remaining = int(round(elapsed * ((100 - progress) / progress)))
+    else:
+        remaining = int(job.get("estimate_seconds") or 0) - elapsed
+    return elapsed, max(0, remaining)
+
+
 def update_job(job_id: str, **changes) -> None:
     with JOBS_LOCK:
         if job_id in JOBS:
@@ -434,11 +522,56 @@ def request_job_stop(job_id: str) -> None:
         process.terminate()
 
 
-def run_command_for_job(job_id: str, command: list[str]) -> None:
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+def run_command_for_job(
+    job_id: str,
+    command: list[str],
+    progress_range: tuple[int, int] | None = None,
+    duration_seconds: float | None = None,
+) -> None:
+    command_to_run = ffmpeg_progress_command(command) if progress_range and duration_seconds else command
+    process = subprocess.Popen(
+        command_to_run,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
     update_job(job_id, process=process)
+    stderr_queue: queue.Queue[str] = queue.Queue()
+    stderr_lines: list[str] = []
+
+    def read_stderr() -> None:
+        if not process.stderr:
+            return
+        for line in process.stderr:
+            stderr_queue.put(line.rstrip())
+
+    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+    stderr_thread.start()
+
+    def drain_stderr() -> None:
+        while True:
+            try:
+                line = stderr_queue.get_nowait()
+            except queue.Empty:
+                return
+            if not line:
+                continue
+            stderr_lines.append(line)
+            elapsed_media_seconds = progress_from_ffmpeg_line(line)
+            if (
+                elapsed_media_seconds is not None
+                and progress_range
+                and duration_seconds
+                and duration_seconds > 0
+            ):
+                start, end = progress_range
+                fraction = min(1.0, elapsed_media_seconds / duration_seconds)
+                update_job_progress(job_id, start + ((end - start) * fraction))
+
     try:
         while True:
+            drain_stderr()
             if JOBS[job_id]["cancel_event"].is_set():
                 process.terminate()
                 try:
@@ -448,16 +581,28 @@ def run_command_for_job(job_id: str, command: list[str]) -> None:
                 raise RuntimeError("Processing stopped by user.")
             code = process.poll()
             if code is not None:
+                stderr_thread.join(timeout=0.5)
+                drain_stderr()
                 if code != 0:
-                    stderr = process.stderr.read().strip() if process.stderr else ""
+                    stderr = "\n".join(
+                        line for line in stderr_lines if not is_ffmpeg_progress_line(line)
+                    ).strip()
                     raise ValueError(stderr or f"Command failed with exit code {code}.")
+                if progress_range:
+                    update_job_progress(job_id, progress_range[1])
                 return
             time.sleep(0.2)
     finally:
         update_job(job_id, process=None)
 
 
-def remux_to_mkv_job(job_id: str, ffmpeg: str, video: Path, output_path: Path) -> None:
+def remux_to_mkv_job(
+    job_id: str,
+    ffmpeg: str,
+    ffprobe: str,
+    video: Path,
+    output_path: Path,
+) -> None:
     command = [
         ffmpeg,
         "-y",
@@ -472,7 +617,12 @@ def remux_to_mkv_job(job_id: str, ffmpeg: str, video: Path, output_path: Path) -
         "copy",
         str(output_path),
     ]
-    run_command_for_job(job_id, command)
+    run_command_for_job(
+        job_id,
+        command,
+        progress_range=(5, 20),
+        duration_seconds=cut.probe_duration(ffprobe, video),
+    )
 
 
 def convert_audio_to_aac_job(job_id: str, ffmpeg: str, ffprobe: str, video: Path, output_path: Path) -> None:
@@ -494,7 +644,12 @@ def convert_audio_to_aac_job(job_id: str, ffmpeg: str, ffprobe: str, video: Path
     else:
         command.extend(["-an"])
     command.extend(["-map", "0:s?", "-c:s", "copy", str(output_path)])
-    run_command_for_job(job_id, command)
+    run_command_for_job(
+        job_id,
+        command,
+        progress_range=(5, 20),
+        duration_seconds=cut.probe_duration(ffprobe, video),
+    )
 
 
 def create_copy_cut_video_job(
@@ -589,7 +744,13 @@ def create_precise_cut_video_job(
     if include_audio:
         command.extend(["-c:a", "aac", "-b:a", "192k"])
     command.extend(["-sn", str(output_path)])
-    run_command_for_job(job_id, command)
+    output_duration = sum(end - start for start, end in keep_segments)
+    run_command_for_job(
+        job_id,
+        command,
+        progress_range=(25, 84),
+        duration_seconds=output_duration,
+    )
 
 
 def extract_subtitle_stream_job(
@@ -622,6 +783,7 @@ def rebuild_subtitles_after_cut_job(
     video: Path,
     subtitle_tracks: list[dict],
     output_path: Path,
+    duration_seconds: float,
 ) -> None:
     command = [
         ffmpeg,
@@ -655,7 +817,12 @@ def rebuild_subtitles_after_cut_job(
             command.extend([f"-disposition:s:{subtitle_index}", "+".join(disposition_flags)])
 
     command.append(str(output_path))
-    run_command_for_job(job_id, command)
+    run_command_for_job(
+        job_id,
+        command,
+        progress_range=(84, 88),
+        duration_seconds=duration_seconds,
+    )
 
 
 def prepare_shifted_subtitle_tracks(
@@ -724,7 +891,12 @@ def add_subtitle_job(
         "language=eng",
         str(output_path),
     ]
-    run_command_for_job(job_id, command)
+    run_command_for_job(
+        job_id,
+        command,
+        progress_range=(88, 95),
+        duration_seconds=cut.probe_duration(ffprobe, video),
+    )
 
 
 def process_video_workflow(
@@ -756,7 +928,7 @@ def process_video_workflow(
         temp_dir = Path(temp_dir_name)
 
         if not audio_ok:
-            update_job(job_id, stage="Converting audio", progress=20, progress_text="Preparing AAC audio")
+            update_job(job_id, stage="Converting audio", progress=5, progress_text="Preparing AAC audio")
             converted = temp_dir / f"{current_video.stem}_audio_fixed.mkv"
             convert_audio_to_aac_job(job_id, ffmpeg, ffprobe, current_video, converted)
             current_video = converted
@@ -767,9 +939,9 @@ def process_video_workflow(
                 item["ok"] for item in summary["light"] if item["label"] == "MKV container"
             )
             if not is_mkv:
-                update_job(job_id, stage="Converting container", progress=20, progress_text="Preparing MKV container")
+                update_job(job_id, stage="Converting container", progress=5, progress_text="Preparing MKV container")
                 remuxed = temp_dir / f"{current_video.stem}_remux.mkv"
-                remux_to_mkv_job(job_id, ffmpeg, current_video, remuxed)
+                remux_to_mkv_job(job_id, ffmpeg, ffprobe, current_video, remuxed)
                 current_video = remuxed
                 operations.append("Container converted to MKV successfully.")
                 append_job_operation(job_id, operations[-1])
@@ -783,6 +955,7 @@ def process_video_workflow(
                     )
             include_audio = cut.has_audio_stream(ffprobe, current_video)
             keep_segments = cut.build_keep_segments_from_cuts(duration, timestamp_ranges)
+            cut_output_duration = sum(end - start for start, end in keep_segments)
             preserved_subtitle_tracks, dropped_subtitle_codecs = prepare_shifted_subtitle_tracks(
                 job_id, ffmpeg, ffprobe, current_video, keep_segments, temp_dir
             )
@@ -808,7 +981,12 @@ def process_video_workflow(
                 )
                 subtitle_output = temp_dir / f"{current_video.stem}_subbed_existing.mkv"
                 rebuild_subtitles_after_cut_job(
-                    job_id, ffmpeg, current_video, preserved_subtitle_tracks, subtitle_output
+                    job_id,
+                    ffmpeg,
+                    current_video,
+                    preserved_subtitle_tracks,
+                    subtitle_output,
+                    cut_output_duration,
                 )
                 current_video = subtitle_output
                 operations.append(
@@ -1029,6 +1207,10 @@ class VideoToolHandler(BaseHTTPRequestHandler):
             "download": "",
             "file": "",
             "estimate_seconds": estimate,
+            "started_at": None,
+            "finished_at": None,
+            "elapsed_seconds": 0,
+            "remaining_seconds": estimate,
             "cancel_event": threading.Event(),
             "process": None,
         }
@@ -1044,6 +1226,8 @@ class VideoToolHandler(BaseHTTPRequestHandler):
                     stage="Starting",
                     progress=5,
                     progress_text="Preparing workflow",
+                    started_at=time.time(),
+                    finished_at=None,
                 )
                 result = process_video_workflow(job_id, video, subtitle, timestamp_ranges)
                 output = result["output"]
@@ -1056,6 +1240,7 @@ class VideoToolHandler(BaseHTTPRequestHandler):
                     progress_text="All operations completed",
                     download=f"/download/{output.name}",
                     file=output.name,
+                    finished_at=time.time(),
                 )
             except RuntimeError as error:
                 update_job(
@@ -1065,6 +1250,7 @@ class VideoToolHandler(BaseHTTPRequestHandler):
                     stage="Stopped",
                     error=str(error),
                     progress_text="Processing stopped",
+                    finished_at=time.time(),
                 )
             except Exception as error:
                 update_job(
@@ -1074,6 +1260,7 @@ class VideoToolHandler(BaseHTTPRequestHandler):
                     stage="Error",
                     error=str(error),
                     progress_text="Processing failed",
+                    finished_at=time.time(),
                 )
 
         thread = threading.Thread(target=runner, daemon=True)
@@ -1092,6 +1279,9 @@ class VideoToolHandler(BaseHTTPRequestHandler):
             job = JOBS.get(job_id)
             if not job:
                 raise ValueError("Process job was not found.")
+            elapsed_seconds, remaining_seconds = job_timing_snapshot(job)
+            job["elapsed_seconds"] = elapsed_seconds
+            job["remaining_seconds"] = remaining_seconds
             payload = {
                 "ok": True,
                 "state": job["state"],
@@ -1104,6 +1294,8 @@ class VideoToolHandler(BaseHTTPRequestHandler):
                 "download": job["download"],
                 "file": job["file"],
                 "estimate_seconds": job["estimate_seconds"],
+                "elapsed_seconds": elapsed_seconds,
+                "remaining_seconds": remaining_seconds,
             }
         self.send_json(payload)
 

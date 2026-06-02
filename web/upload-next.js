@@ -10,10 +10,14 @@ const nextStatus = document.querySelector("#nextStatus");
 const runButton = document.querySelector("#runButton");
 const downloadButton = document.querySelector("#downloadButton");
 const stopButton = document.querySelector("#stopButton");
+const estimateLabel = document.querySelector("#estimateLabel");
 const estimateTime = document.querySelector("#estimateTime");
 const processState = document.querySelector("#processState");
 const dashboardLoader = document.querySelector("#dashboardLoader");
 const dashboardLoaderText = document.querySelector("#dashboardLoaderText");
+const processProgress = document.querySelector("#processProgress");
+const processProgressFill = document.querySelector("#processProgressFill");
+const processProgressText = document.querySelector("#processProgressText");
 const needCardTemplate = document.querySelector("#needCardTemplate");
 
 let inspectData = null;
@@ -23,6 +27,11 @@ let runReady = false;
 let downloadUrl = "";
 let activeJobId = "";
 let stopRequested = false;
+let processingLocked = false;
+let completionAudioContext = null;
+const notifiedJobs = new Set();
+const PROCESS_LOCK_MESSAGE =
+  "You can't use this function while processing is running. To use it, click the Stop button.";
 
 function getVideoFromUrl() {
   const params = new URLSearchParams(window.location.search);
@@ -226,14 +235,14 @@ function timestampTemplate(start = "", end = "") {
       <div class="timestamp-pill">Scene</div>
       <label class="field compact-field compact-timestamp-field">
         <span>Start</span>
-        <input class="timestamp-input" data-kind="start" type="text" value="${escapeHtml(start)}" placeholder="00:00:00" />
+        <input class="timestamp-input" data-kind="start" type="text" value="${escapeHtml(start)}" placeholder="00:00:00" aria-keyshortcuts="Shift+1" />
       </label>
       <div class="timestamp-separator">to</div>
       <label class="field compact-field compact-timestamp-field">
         <span>End</span>
-        <input class="timestamp-input" data-kind="end" type="text" value="${escapeHtml(end)}" placeholder="00:00:00" />
+        <input class="timestamp-input" data-kind="end" type="text" value="${escapeHtml(end)}" placeholder="00:00:00" aria-keyshortcuts="Shift+2" />
       </label>
-      <button class="ghost-button remove-row" type="button">Remove</button>
+      <button class="ghost-button remove-row" type="button" aria-keyshortcuts="Shift+R">Remove</button>
     </div>
   `;
 }
@@ -242,6 +251,52 @@ function ensureTimestampRows() {
   if (!timestampRows.children.length) {
     timestampRows.insertAdjacentHTML("beforeend", timestampTemplate());
   }
+}
+
+function activeTimestampRow() {
+  const activeElement = document.activeElement;
+  const currentRow = activeElement?.closest?.(".timestamp-row");
+  if (currentRow && timestampRows.contains(currentRow)) return currentRow;
+
+  return (
+    [...timestampRows.querySelectorAll(".timestamp-row")].find((row) => {
+      const start = row.querySelector('[data-kind="start"]').value.trim();
+      const end = row.querySelector('[data-kind="end"]').value.trim();
+      return !start || !end;
+    }) || timestampRows.querySelector(".timestamp-row")
+  );
+}
+
+function focusTimestampShortcut(kind) {
+  ensureTimestampRows();
+  const row = activeTimestampRow();
+  const input = row?.querySelector(`[data-kind="${kind}"]`);
+  if (!input) return;
+  input.focus();
+  const cursorPosition = input.value.length;
+  input.setSelectionRange(cursorPosition, cursorPosition);
+}
+
+function addTimestampRow() {
+  if (guardProcessingLock()) return;
+  const error = validateTimestamps();
+  if (error) {
+    timestampValidation.textContent = error;
+    return;
+  }
+  timestampRows.insertAdjacentHTML("beforeend", timestampTemplate());
+  resetRunState();
+  renderPendingChanges();
+}
+
+function removeTimestampRow(row) {
+  if (guardProcessingLock()) return;
+  if (!row) return;
+  row.remove();
+  ensureTimestampRows();
+  timestampValidation.textContent = validateTimestamps();
+  resetRunState();
+  renderPendingChanges();
 }
 
 function timeToSeconds(value) {
@@ -313,6 +368,123 @@ function selectedSubtitleName() {
   return (select && select.value.trim()) || (uploadName && uploadName.textContent.trim()) || subtitleSelection || "";
 }
 
+function alertProcessingLock() {
+  alert(PROCESS_LOCK_MESSAGE);
+}
+
+function guardProcessingLock() {
+  if (!processingLocked) return false;
+  alertProcessingLock();
+  return true;
+}
+
+function setProgressMeter(percent) {
+  const value = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  processProgress.style.setProperty("--progress", `${value}%`);
+  processProgress.setAttribute("aria-valuenow", String(value));
+  processProgressFill.style.width = `${value}%`;
+  processProgressText.textContent = `${value}%`;
+}
+
+function setProcessingLocked(locked) {
+  processingLocked = locked;
+  document.body.classList.toggle("is-processing", locked);
+  addTimestampButton.setAttribute("aria-disabled", locked ? "true" : "false");
+  runButton.setAttribute("aria-disabled", locked ? "true" : "false");
+
+  timestampRows.querySelectorAll(".timestamp-input").forEach((input) => {
+    input.disabled = locked;
+  });
+  timestampRows.querySelectorAll(".remove-row").forEach((button) => {
+    button.setAttribute("aria-disabled", locked ? "true" : "false");
+  });
+  document
+    .querySelectorAll("#nextSubtitleSelect, #nextSubtitleFile, #nextSubtitleUpload button")
+    .forEach((control) => {
+      control.disabled = locked;
+    });
+}
+
+function formatDuration(totalSeconds) {
+  const secondsValue = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  if (secondsValue < 60) return `${secondsValue}s`;
+  const minutes = Math.floor(secondsValue / 60);
+  const seconds = secondsValue % 60;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+function updateTimeCard(data) {
+  if (data?.state === "success") {
+    estimateLabel.textContent = "Total time";
+    estimateTime.textContent = formatDuration(data.elapsed_seconds);
+    return;
+  }
+  if (data?.state === "error" || data?.state === "stopped") {
+    estimateLabel.textContent = "Elapsed";
+    estimateTime.textContent = formatDuration(data.elapsed_seconds);
+    return;
+  }
+  if (data?.state === "queued" || data?.state === "running") {
+    estimateLabel.textContent = "Time left";
+    estimateTime.textContent = `${formatDuration(data.remaining_seconds)} left`;
+  }
+}
+
+function prepareCompletionAlerts() {
+  if ("Notification" in window && Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+    completionAudioContext = completionAudioContext || new AudioContextClass();
+    if (completionAudioContext.state === "suspended") {
+      completionAudioContext.resume().catch(() => {});
+    }
+  } catch {
+    completionAudioContext = null;
+  }
+}
+
+function playCompletionSound() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const context = completionAudioContext || new AudioContextClass();
+    completionAudioContext = context;
+    if (context.state === "suspended") {
+      context.resume().catch(() => {});
+    }
+    const start = context.currentTime;
+    const gain = context.createGain();
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(0.18, start + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.7);
+    gain.connect(context.destination);
+
+    [660, 880].forEach((frequency, index) => {
+      const oscillator = context.createOscillator();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(frequency, start + index * 0.18);
+      oscillator.connect(gain);
+      oscillator.start(start + index * 0.18);
+      oscillator.stop(start + index * 0.18 + 0.28);
+    });
+  } catch {
+    // Sound is a convenience; status and browser notification still complete the flow.
+  }
+}
+
+function notifyCompletion(jobId) {
+  if (notifiedJobs.has(jobId)) return;
+  notifiedJobs.add(jobId);
+  playCompletionSound();
+  if ("Notification" in window && Notification.permission === "granted") {
+    new Notification("Video process complete", {
+      body: "Your final video is ready to download.",
+    });
+  }
+}
+
 function setDashboardLines(lines) {
   nextStatus.innerHTML = lines.map((line) => `<div class="status-line">${escapeHtml(line)}</div>`).join("");
 }
@@ -342,13 +514,11 @@ function estimateSeconds() {
 }
 
 function formatEstimate(totalSeconds) {
-  if (totalSeconds < 60) return `~${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `~${minutes}m ${seconds}s`;
+  return `~${formatDuration(totalSeconds)}`;
 }
 
 function updateEstimate() {
+  estimateLabel.textContent = "Estimate time";
   estimateTime.textContent = formatEstimate(estimateSeconds());
 }
 
@@ -391,6 +561,8 @@ function resetRunState() {
   downloadUrl = "";
   activeJobId = "";
   stopRequested = false;
+  setProcessingLocked(false);
+  setProgressMeter(0);
   downloadButton.hidden = true;
   stopButton.hidden = true;
   processState.textContent = "Waiting";
@@ -421,6 +593,11 @@ function bindSubtitleControls() {
 
   if (select) {
     select.addEventListener("change", () => {
+      if (processingLocked) {
+        select.value = subtitleSelection;
+        alertProcessingLock();
+        return;
+      }
       subtitleSelection = select.value;
       resetRunState();
       renderPendingChanges();
@@ -429,6 +606,11 @@ function bindSubtitleControls() {
 
   if (fileInput && nameNode) {
     fileInput.addEventListener("change", () => {
+      if (processingLocked) {
+        fileInput.value = "";
+        alertProcessingLock();
+        return;
+      }
       const file = fileInput.files[0];
       nameNode.textContent = file ? file.name : "No subtitle selected";
       resetRunState();
@@ -439,6 +621,7 @@ function bindSubtitleControls() {
   if (uploadForm && fileInput && nameNode) {
     uploadForm.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (guardProcessingLock()) return;
       if (!fileInput.files.length) {
         setDashboardLines(["Choose a subtitle file first."]);
         return;
@@ -465,6 +648,8 @@ async function pollJob(jobId) {
     const response = await fetch(`/api/process/status?id=${encodeURIComponent(jobId)}`);
     const data = await response.json();
     processState.textContent = data.state_label || data.state;
+    setProgressMeter(data.progress);
+    updateTimeCard(data);
     if (!stopRequested && (data.state === "queued" || data.state === "running")) {
       setDashboardLoader("running", data.progress_text || data.stage || "Rabbit is running...");
     }
@@ -485,7 +670,10 @@ async function pollJob(jobId) {
       runButton.disabled = false;
       activeJobId = "";
       stopRequested = false;
+      setProcessingLocked(false);
+      setProgressMeter(100);
       setDashboardLoader("success", "Rabbit says your video is ready.");
+      notifyCompletion(jobId);
       return;
     }
 
@@ -496,6 +684,7 @@ async function pollJob(jobId) {
       runButton.disabled = false;
       activeJobId = "";
       stopRequested = false;
+      setProcessingLocked(false);
       setDashboardLoader("idle");
       return;
     }
@@ -527,33 +716,42 @@ async function loadPage() {
 }
 
 addTimestampButton.addEventListener("click", () => {
-  const error = validateTimestamps();
-  if (error) {
-    timestampValidation.textContent = error;
-    return;
-  }
-  timestampRows.insertAdjacentHTML("beforeend", timestampTemplate());
-  resetRunState();
-  renderPendingChanges();
+  addTimestampRow();
 });
 
 timestampRows.addEventListener("click", (event) => {
   const button = event.target.closest(".remove-row");
   if (!button) return;
-  button.closest(".timestamp-row").remove();
-  ensureTimestampRows();
-  timestampValidation.textContent = validateTimestamps();
-  resetRunState();
-  renderPendingChanges();
+  removeTimestampRow(button.closest(".timestamp-row"));
 });
 
 timestampRows.addEventListener("input", () => {
+  if (processingLocked) return;
   timestampValidation.textContent = validateTimestamps();
   resetRunState();
   renderPendingChanges();
 });
 
+document.addEventListener("keydown", (event) => {
+  if (!event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return;
+  const shortcuts = {
+    Digit1: () => focusTimestampShortcut("start"),
+    Numpad1: () => focusTimestampShortcut("start"),
+    Digit2: () => focusTimestampShortcut("end"),
+    Numpad2: () => focusTimestampShortcut("end"),
+    KeyA: addTimestampRow,
+    KeyR: () => removeTimestampRow(activeTimestampRow()),
+    KeyU: () => runButton.click(),
+    KeyS: () => stopButton.click(),
+  };
+  const shortcut = shortcuts[event.code];
+  if (!shortcut) return;
+  event.preventDefault();
+  shortcut();
+});
+
 runButton.addEventListener("click", async () => {
+  if (guardProcessingLock()) return;
   const error = validateTimestamps();
   timestampValidation.textContent = error;
   if (error) {
@@ -572,10 +770,12 @@ runButton.addEventListener("click", async () => {
   const subtitleToUse =
     subtitleNeeded && subtitle && subtitle !== "No subtitle selected" ? subtitle : "";
 
-  runButton.disabled = true;
   resetRunState();
+  setProcessingLocked(true);
+  prepareCompletionAlerts();
   stopRequested = false;
   processState.textContent = "Starting";
+  setProgressMeter(1);
   stopButton.hidden = false;
   setDashboardLines(["Starting processing job..."]);
   setDashboardLoader("running", "Rabbit is getting ready...");
@@ -593,6 +793,7 @@ runButton.addEventListener("click", async () => {
   } catch (runError) {
     processState.textContent = "Error";
     setDashboardLines([`Run stopped: ${runError.message}`]);
+    setProcessingLocked(false);
     runButton.disabled = false;
     setDashboardLoader("idle");
   }
