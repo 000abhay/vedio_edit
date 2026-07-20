@@ -84,7 +84,7 @@ Merge an uploaded subtitle file into an MKV:
 python cut.py add-sub "C:\full\path\to\movie.mkv" "C:\full\path\to\english.srt"
 ```
 
-Heavy operations such as H.265 to H.264 conversion, resizing, subtitle burn-in, compression, and exact frame cuts still need full re-encoding. Codespaces may stop those long jobs, so the script keeps them optional.
+Heavy operations such as resizing, subtitle burn-in, compression, and exact frame cuts still need full re-encoding. The local web workflow now automatically converts non-TV-friendly video codecs such as H.265/HEVC to H.264 when needed.
 
 ## Frontend
 
@@ -105,6 +105,7 @@ The frontend supports:
 - uploading a video file before inspection
 - uploading small subtitle files
 - inspecting TV-relevant video properties
+- automatically converting H.265/HEVC video to H.264 when needed
 - cutting the marked scenes with fast copy mode
 - remuxing to MKV
 - merging uploaded subtitles

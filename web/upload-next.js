@@ -142,7 +142,7 @@ function activeNeeds() {
       key: "video",
       tag: "Video",
       title: "Video Codec",
-      copy: "The current video codec is not TV-friendly. This change may require a heavy re-encode, so we show it only when needed.",
+      copy: "The current video codec is not TV-friendly. FFmpeg will convert it to H.264 automatically when you run the process.",
       body: `<div class="mini-note warn">Current: ${escapeHtml(videoCodec.detail)}</div>`,
     });
   }
@@ -502,11 +502,13 @@ function estimateSeconds() {
   const sizeMiB = sizeMatch ? Number(sizeMatch[1]) : 0;
   const ranges = collectTimestamps().filter((item) => item.start && item.end).length;
   const mkv = findCheck("MKV container");
+  const videoCodec = findCheck("TV-friendly video codec");
   const audioCodec = findCheck("TV-friendly audio codec");
   const englishSubtitle = findCheck("English subtitles");
   const textSubtitle = findCheck("Text subtitle format");
   let seconds = 8 + Math.ceil(sizeMiB / 25);
   if (mkv && !mkv.ok) seconds += 12;
+  if (videoCodec && !videoCodec.ok && ranges === 0) seconds += Math.max(60, Math.ceil(sizeMiB / 6));
   if (audioCodec && !audioCodec.ok) seconds += 18;
   if ((englishSubtitle && !englishSubtitle.ok) || (textSubtitle && !textSubtitle.ok)) seconds += 6;
   seconds += ranges * 5;
@@ -534,7 +536,7 @@ function renderPendingChanges() {
   rows.push(createProfileRow("Video", getVideoFromUrl().split("/").pop() || "unknown"));
 
   if (mkv && !mkv.ok) rows.push(createProfileRow("Container", "Convert to MKV"));
-  if (videoCodec && !videoCodec.ok) rows.push(createProfileRow("Video codec", "Needs TV-ready conversion"));
+  if (videoCodec && !videoCodec.ok) rows.push(createProfileRow("Video codec", "Convert to H.264"));
   if (audioCodec && !audioCodec.ok) rows.push(createProfileRow("Audio codec", "Convert audio track"));
 
   if ((englishSubtitle && !englishSubtitle.ok) || (textSubtitle && !textSubtitle.ok)) {

@@ -28,6 +28,8 @@ WEB_DIR = ROOT / "web"
 UPLOAD_DIR = ROOT / "uploads"
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".m4v", ".webm"}
 SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt"}
+H264_VIDEO_PRESET = "veryfast"
+H264_VIDEO_CRF = "24"
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
@@ -240,7 +242,7 @@ def inspect_summary(ffprobe: str, video: Path) -> dict:
             {
                 "label": "H.265/AV1/VP9 to H.264",
                 "ok": video_ok,
-                "detail": "Not needed" if video_ok else "Needs full video re-encode",
+                "detail": "Not needed" if video_ok else "Will convert to H.264 with full re-encode",
             },
             {
                 "label": "Resize/compress video",
@@ -401,11 +403,16 @@ def estimate_process_seconds(video: Path, summary: dict, timestamp_ranges: list[
     estimate = 8 + int(size_mib / 25)
     if not next(item["ok"] for item in summary["light"] if item["label"] == "MKV container"):
         estimate += 12
+    video_codec_ok = next(
+        item["ok"] for item in summary["light"] if item["label"] == "TV-friendly video codec"
+    )
     if not next(item["ok"] for item in summary["light"] if item["label"] == "TV-friendly audio codec"):
         estimate += 18
     subtitle_ok = next(item["ok"] for item in summary["light"] if item["label"] == "English subtitles")
     if not subtitle_ok:
         estimate += 6
+    if not video_codec_ok and not timestamp_ranges:
+        estimate += max(60, int(size_mib / 6))
     if timestamp_ranges:
         estimate += max(20, int(size_mib / 12))
         estimate += len(timestamp_ranges) * 10
@@ -648,6 +655,45 @@ def convert_audio_to_aac_job(job_id: str, ffmpeg: str, ffprobe: str, video: Path
         job_id,
         command,
         progress_range=(5, 20),
+        duration_seconds=cut.probe_duration(ffprobe, video),
+    )
+
+
+def convert_video_to_h264_job(
+    job_id: str,
+    ffmpeg: str,
+    ffprobe: str,
+    video: Path,
+    output_path: Path,
+) -> None:
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        H264_VIDEO_PRESET,
+        "-crf",
+        H264_VIDEO_CRF,
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if cut.has_audio_stream(ffprobe, video):
+        command.extend(["-map", "0:a:0?", "-c:a", "aac", "-b:a", "160k", "-ac:a", "2"])
+    else:
+        command.extend(["-an"])
+    command.extend(["-map", "0:s?", "-c:s", "copy", str(output_path)])
+    run_command_for_job(
+        job_id,
+        command,
+        progress_range=(5, 84),
         duration_seconds=cut.probe_duration(ffprobe, video),
     )
 
@@ -914,18 +960,39 @@ def process_video_workflow(
     video_ok = next(
         item["ok"] for item in summary["light"] if item["label"] == "TV-friendly video codec"
     )
+    video_codec_detail = next(
+        item["detail"] for item in summary["light"] if item["label"] == "TV-friendly video codec"
+    )
     audio_ok = next(
         item["ok"] for item in summary["light"] if item["label"] == "TV-friendly audio codec"
     )
 
-    if not video_ok:
-        raise ValueError(
-            "This video needs full video re-encode to become TV-ready. "
-            "That heavy step is not enabled in this lightweight web workflow yet."
-        )
-
     with tempfile.TemporaryDirectory(prefix="web-video-process-", dir=ROOT) as temp_dir_name:
         temp_dir = Path(temp_dir_name)
+
+        if not video_ok and not timestamp_ranges:
+            update_job(
+                job_id,
+                stage="Converting video",
+                progress=5,
+                progress_text="Converting video to H.264",
+            )
+            converted = temp_dir / f"{current_video.stem}_h264.mkv"
+            convert_video_to_h264_job(job_id, ffmpeg, ffprobe, current_video, converted)
+            current_video = converted
+            summary = inspect_summary(ffprobe, current_video)
+            audio_ok = next(
+                item["ok"] for item in summary["light"] if item["label"] == "TV-friendly audio codec"
+            )
+            operations.append(
+                f"Video converted to H.264 for TV playback ({video_codec_detail} source, {H264_VIDEO_PRESET}, CRF {H264_VIDEO_CRF})."
+            )
+            append_job_operation(job_id, operations[-1])
+        elif not video_ok:
+            operations.append(
+                f"Video codec ({video_codec_detail}) will be converted to H.264 during timestamp cuts."
+            )
+            append_job_operation(job_id, operations[-1])
 
         if not audio_ok:
             update_job(job_id, stage="Converting audio", progress=5, progress_text="Preparing AAC audio")
